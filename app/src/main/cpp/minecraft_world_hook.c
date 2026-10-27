@@ -6,7 +6,10 @@
 #include <limits.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
+#include <strings.h>
+#include <sys/mman.h>
 
 #define LOG_TAG "KafkaWorldHook"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
@@ -646,52 +649,6 @@ static int set_pending_chat_message(const char *utf) {
     return 1;
 }
 
-static int make_short_std_string(uint8_t *string_object, size_t object_size, const char *value) {
-    if (string_object == NULL || object_size < 24 || value == NULL) {
-        return 0;
-    }
-    size_t length = strlen(value);
-    if (length > 22) {
-        return 0;
-    }
-    memset(string_object, 0, object_size);
-    string_object[0] = (uint8_t) (length << 1u);
-    memcpy(string_object + 1, value, length);
-    return 1;
-}
-
-static int send_with_screen_model(void *screen_model, const char *utf, int force_command) {
-    if (screen_model == NULL || utf == NULL) {
-        return 0;
-    }
-
-    uint8_t message_object[24];
-    if (!make_short_std_string(message_object, sizeof(message_object), utf)) {
-        LOGE("[MODEL ACTION] failed to build short std::string for \"%s\"", utf);
-        return 0;
-    }
-
-    if (force_command || utf[0] == '/') {
-        if (original_screen_model_execute_command == NULL) {
-            LOGE("[MODEL ACTION] executeCommand candidate is not installed");
-            return 0;
-        }
-        LOGI("[MODEL ACTION] executeCommand msg=\"%s\"", utf);
-        original_screen_model_execute_command(
-                screen_model, message_object, NULL, NULL, NULL, NULL, NULL, NULL);
-        return 1;
-    }
-
-    if (original_screen_model_send_chat == NULL) {
-        LOGE("[MODEL ACTION] sendChatMessage candidate is not installed");
-        return 0;
-    }
-    LOGI("[MODEL ACTION] sendChatMessage msg=\"%s\"", utf);
-    original_screen_model_send_chat(
-            screen_model, message_object, NULL, NULL, NULL, NULL, NULL, NULL);
-    return 1;
-}
-
 static uintptr_t find_binary_pattern(
         const mapping *mappings,
         size_t mapping_count,
@@ -967,7 +924,6 @@ static uintptr_t screen_model_send_chat_hook(
         const void *arg6,
         const void *arg7) {
     char captured[256];
-    int action = 0;
     if (read_message_arguments(
             arg1,
             arg2,
@@ -983,23 +939,12 @@ static uintptr_t screen_model_send_chat_hook(
         LOGI("[MODEL SEND] msg=\"%s\"", captured);
 
         notify_java_chat_message("model-sendChatMessage", captured);
-
-        if (captured[0] == '#') {
-            action = 1;
-        } else if (captured[0] == '@') {
-            action = 2;
-        }
     } else {
         LOGE("[MODEL SEND] failed to read message");
     }
-    uintptr_t result = original_screen_model_send_chat(
+
+    return original_screen_model_send_chat(
             screen_model, arg1, arg2, arg3, arg4, arg5, arg6, arg7);
-    if (action == 1) {
-        send_with_screen_model(screen_model, "/say pwn!", 1);
-    } else if (action == 2) {
-        send_with_screen_model(screen_model, "[pwn!]", 0);
-    }
-    return result;
 }
 
 static uintptr_t screen_model_execute_command_hook(
@@ -1073,6 +1018,101 @@ static uintptr_t chat_dispatch_hook(void *chat_screen_controller) {
     }
 
     return original_chat_dispatch(chat_screen_controller);
+}
+
+static int patch_code_bytes(
+        const mapping *mappings,
+        size_t mapping_count,
+        uintptr_t load_bias,
+        uintptr_t rva,
+        const uint8_t *expected,
+        const uint8_t *replacement,
+        size_t size,
+        const char *label) {
+    uintptr_t target = load_bias + rva;
+
+    int in_mapping = 0;
+    for (size_t map_index = 0; map_index < mapping_count; map_index++) {
+        if (target >= mappings[map_index].start
+                && target + size <= mappings[map_index].end) {
+            in_mapping = 1;
+            break;
+        }
+    }
+    if (!in_mapping) {
+        LOGE("[%s] target is outside executable mappings", label);
+        return 0;
+    }
+
+    if (memcmp((const void *) target, replacement, size) == 0) {
+        LOGI("[%s] already patched", label);
+        return 1;
+    }
+    if (memcmp((const void *) target, expected, size) != 0) {
+        uint32_t current = 0;
+        memcpy(&current, (const void *) target, sizeof(current));
+        LOGE("[%s] bytes mismatch at +0x%x: expected first word 0x%08x got 0x%08x",
+                label,
+                (unsigned) rva,
+                (unsigned) *(const uint32_t *) expected,
+                (unsigned) current);
+        return 0;
+    }
+
+    uintptr_t page_start = target & ~(uintptr_t) 0xFFF;
+    if (mprotect((void *) page_start, 0x1000, PROT_READ | PROT_WRITE | PROT_EXEC) != 0) {
+        LOGE("[%s] mprotect failed", label);
+        return 0;
+    }
+
+    memcpy((void *) target, replacement, size);
+    __builtin___clear_cache((char *) target, (char *) target + size);
+    mprotect((void *) page_start, 0x1000, PROT_READ | PROT_EXEC);
+
+    LOGI("[%s] patched +0x%x (%u bytes)", label, (unsigned) rva, (unsigned) size);
+    return 1;
+}
+
+static int patch_enchant_validator(const mapping *mappings, size_t mapping_count, uintptr_t load_bias) {
+    static const uint8_t expected[] = {0xC0, 0x01, 0x00, 0x36}; // TBZ W0,#0
+    static const uint8_t replacement[] = {0x1F, 0x20, 0x03, 0xD5}; // NOP
+    return patch_code_bytes(
+            mappings,
+            mapping_count,
+            load_bias,
+            0x8F73200,
+            expected,
+            replacement,
+            sizeof(expected),
+            "enchant-validator");
+}
+
+static int patch_enchant_level_gate(const mapping *mappings, size_t mapping_count, uintptr_t load_bias) {
+    static const uint8_t expected[] = {0x60, 0x3B, 0x00, 0x36}; // TBZ W0,#0 (level range gate)
+    static const uint8_t replacement[] = {0x1F, 0x20, 0x03, 0xD5}; // NOP
+    return patch_code_bytes(
+            mappings,
+            mapping_count,
+            load_bias,
+            0x5D253A4,
+            expected,
+            replacement,
+            sizeof(expected),
+            "enchant-level-gate");
+}
+
+static int patch_enchant_compat(const mapping *mappings, size_t mapping_count, uintptr_t load_bias) {
+    static const uint8_t expected[] = {0x3F, 0x00, 0x00, 0x71, 0xE8, 0x07, 0x9F, 0x1A}; // CMP W1,#0; CSET W8,NE
+    static const uint8_t replacement[] = {0x20, 0x00, 0x80, 0xD2, 0xC0, 0x03, 0x5F, 0xD6}; // MOV X0,#1; RET
+    return patch_code_bytes(
+            mappings,
+            mapping_count,
+            load_bias,
+            0xB631E4C,
+            expected,
+            replacement,
+            sizeof(expected),
+            "enchant-compat");
 }
 
 static int looks_like_arm64_function_entry(uintptr_t address) {
@@ -1296,11 +1336,17 @@ int kafka_install_world_entered_hook(
             load_bias);
     int chat_hooks_installed = install_chat_dispatch_hook(mappings, mapping_count, load_bias);
     int model_hooks_installed = install_screen_model_message_hooks(mappings, mapping_count, load_bias);
+    int enchant_validator_patched = patch_enchant_validator(mappings, mapping_count, load_bias);
+    int enchant_level_gate_patched = patch_enchant_level_gate(mappings, mapping_count, load_bias);
+    int enchant_compat_patched = patch_enchant_compat(mappings, mapping_count, load_bias);
     __atomic_store_n(
             &hook_installation_state,
-            (world_hook_installed || chat_hooks_installed || model_hooks_installed) ? 2 : 3,
+            (world_hook_installed || chat_hooks_installed || model_hooks_installed
+                    || enchant_validator_patched || enchant_level_gate_patched
+                    || enchant_compat_patched) ? 2 : 3,
             __ATOMIC_RELEASE);
-    return world_hook_installed || chat_hooks_installed || model_hooks_installed;
+    return world_hook_installed || chat_hooks_installed || model_hooks_installed
+            || enchant_validator_patched || enchant_level_gate_patched || enchant_compat_patched;
 }
 
 JNIEXPORT jboolean JNICALL
